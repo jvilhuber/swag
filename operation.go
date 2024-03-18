@@ -21,6 +21,7 @@ import (
 type RouteProperties struct {
 	HTTPMethod string
 	Path       string
+	Deprecated bool
 }
 
 // Operation describes a single API operation on a path.
@@ -147,7 +148,9 @@ func (operation *Operation) ParseComment(comment string, astFile *ast.File) erro
 	case headerAttr:
 		return operation.ParseResponseHeaderComment(lineRemainder, astFile)
 	case routerAttr:
-		return operation.ParseRouterComment(lineRemainder)
+		return operation.ParseRouterComment(lineRemainder, false)
+	case deprecatedRouterAttr:
+		return operation.ParseRouterComment(lineRemainder, true)
 	case securityAttr:
 		return operation.ParseSecurityComment(lineRemainder)
 	case deprecatedAttr:
@@ -283,16 +286,7 @@ func (operation *Operation) ParseParamComment(commentLine string, astFile *ast.F
 	param := createParameter(paramType, description, name, objectType, refType, required, enums, operation.parser.collectionFormatInQuery)
 
 	switch paramType {
-	case "path", "header":
-		switch objectType {
-		case ARRAY:
-			if !IsPrimitiveType(refType) {
-				return fmt.Errorf("%s is not supported array type for %s", refType, paramType)
-			}
-		case OBJECT:
-			return fmt.Errorf("%s is not supported type for %s", refType, paramType)
-		}
-	case "query", "formData":
+	case "path", "header", "query", "formData":
 		switch objectType {
 		case ARRAY:
 			if !IsPrimitiveType(refType) && !(refType == "file" && paramType == "formData") {
@@ -321,11 +315,14 @@ func (operation *Operation) ParseParamComment(commentLine string, astFile *ast.F
 					}
 				}
 
-				var formName = name
-				if item.Schema.Extensions != nil {
-					if nameVal, ok := item.Schema.Extensions[formTag]; ok {
-						formName = nameVal.(string)
-					}
+				nameOverrideType := paramType
+				// query also uses formData tags
+				if paramType == "query" {
+					nameOverrideType = "formData"
+				}
+				// load overridden type specific name from extensions if exists
+				if nameVal, ok := item.Schema.Extensions[nameOverrideType]; ok {
+					name = nameVal.(string)
 				}
 
 				switch {
@@ -337,16 +334,19 @@ func (operation *Operation) ParseParamComment(commentLine string, astFile *ast.F
 					if len(itemSchema.Type) == 0 {
 						itemSchema = operation.parser.getUnderlyingSchema(prop.Items.Schema)
 					}
+					if itemSchema == nil {
+						continue
+					}
 					if len(itemSchema.Type) == 0 {
 						continue
 					}
 					if !IsSimplePrimitiveType(itemSchema.Type[0]) {
 						continue
 					}
-					param = createParameter(paramType, prop.Description, formName, prop.Type[0], itemSchema.Type[0], findInSlice(schema.Required, name), itemSchema.Enum, operation.parser.collectionFormatInQuery)
+					param = createParameter(paramType, prop.Description, name, prop.Type[0], itemSchema.Type[0], findInSlice(schema.Required, item.Name), itemSchema.Enum, operation.parser.collectionFormatInQuery)
 
 				case IsSimplePrimitiveType(prop.Type[0]):
-					param = createParameter(paramType, prop.Description, formName, PRIMITIVE, prop.Type[0], findInSlice(schema.Required, name), nil, operation.parser.collectionFormatInQuery)
+					param = createParameter(paramType, prop.Description, name, PRIMITIVE, prop.Type[0], findInSlice(schema.Required, item.Name), nil, operation.parser.collectionFormatInQuery)
 				default:
 					operation.parser.debug.Printf("skip field [%s] in %s is not supported type for %s", name, refType, paramType)
 					continue
@@ -403,12 +403,15 @@ func (operation *Operation) ParseParamComment(commentLine string, astFile *ast.F
 const (
 	formTag             = "form"
 	jsonTag             = "json"
+	uriTag              = "uri"
+	headerTag           = "header"
 	bindingTag          = "binding"
 	defaultTag          = "default"
 	enumsTag            = "enums"
 	exampleTag          = "example"
 	schemaExampleTag    = "schemaExample"
 	formatTag           = "format"
+	titleTag            = "title"
 	validateTag         = "validate"
 	minimumTag          = "minimum"
 	maximumTag          = "maximum"
@@ -707,7 +710,7 @@ func parseMimeTypeList(mimeTypeList string, typeList *[]string, format string) e
 var routerPattern = regexp.MustCompile(`^(/[\w./\-{}+:$]*)[[:blank:]]+\[(\w+)]`)
 
 // ParseRouterComment parses comment for given `router` comment string.
-func (operation *Operation) ParseRouterComment(commentLine string) error {
+func (operation *Operation) ParseRouterComment(commentLine string, deprecated bool) error {
 	matches := routerPattern.FindStringSubmatch(commentLine)
 	if len(matches) != 3 {
 		return fmt.Errorf("can not parse router comment \"%s\"", commentLine)
@@ -716,6 +719,7 @@ func (operation *Operation) ParseRouterComment(commentLine string) error {
 	signature := RouteProperties{
 		Path:       matches[1],
 		HTTPMethod: strings.ToUpper(matches[2]),
+		Deprecated: deprecated,
 	}
 
 	if _, ok := allMethod[signature.HTTPMethod]; !ok {
